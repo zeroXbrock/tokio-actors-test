@@ -58,14 +58,18 @@ impl TxActorHandle {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let actor = TxActorHandle::new(1000);
+    let n = 5000_usize;
+    let actor = TxActorHandle::new(24);
     let sender = Arc::new(actor.sender);
     let mut handles = vec![];
-    for i in 0..1000 {
+    for i in 0..n {
         let sender = sender.clone();
         let handle = tokio::task::spawn(async move {
             println!("sending SetId (id: {})", i);
-            sender.send(ActorMessage::SetId { id: i }).await.unwrap();
+            sender
+                .send(ActorMessage::SetId { id: i as u32 })
+                .await
+                .unwrap();
         });
         handles.push(handle);
     }
