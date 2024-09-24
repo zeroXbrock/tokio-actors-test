@@ -46,26 +46,19 @@ pub struct TxActorHandle {
 }
 
 impl TxActorHandle {
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel(100);
+    pub fn new(bufsize: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(bufsize);
         let mut actor = TxActor::new(receiver);
         tokio::task::spawn(async move {
             actor.run().await;
         });
         TxActorHandle { sender }
     }
-
-    pub async fn get_unique_id(&mut self) -> u32 {
-        let (sender, receiver) = oneshot::channel();
-        let message = ActorMessage::GetUniqueId { respond_to: sender };
-        let _ = self.sender.send(message).await;
-        receiver.await.unwrap()
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let actor = TxActorHandle::new();
+    let actor = TxActorHandle::new(1000);
     let sender = Arc::new(actor.sender);
     let mut handles = vec![];
     for i in 0..1000 {
