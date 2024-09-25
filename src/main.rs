@@ -14,7 +14,9 @@ enum ActorMessage {
         request: TransactionRequest,
         respond_to: oneshot::Sender<Option<TransactionReceipt>>,
     },
-    DumpCache,
+    DumpCache {
+        respond_to: oneshot::Sender<()>,
+    },
 }
 
 struct TxActor<M>
@@ -75,8 +77,9 @@ where
                 self.cache.push(request);
                 let _ = respond_to.send(None);
             }
-            ActorMessage::DumpCache => {
+            ActorMessage::DumpCache { respond_to } => {
                 self.export_cache();
+                respond_to.send(()).unwrap();
             }
         }
     }
@@ -141,7 +144,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.await.unwrap();
     }
 
-    sender.send(ActorMessage::DumpCache).await.unwrap();
+    let (dump_sender, receiver) = oneshot::channel();
+    sender
+        .send(ActorMessage::DumpCache {
+            respond_to: dump_sender,
+        })
+        .await
+        .unwrap();
+    receiver.await.unwrap();
 
     let db = db.get().unwrap();
     let count: u64 = db.query_row("SELECT COUNT(*) FROM runs", params![], |row| row.get(0))?;
