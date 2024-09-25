@@ -1,35 +1,82 @@
+use alloy::{
+    hex::ToHexExt,
+    primitives::Address,
+    rpc::types::{TransactionReceipt, TransactionRequest},
+};
+use r2d2::{ManageConnection, Pool};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 enum ActorMessage {
-    GetUniqueId { respond_to: oneshot::Sender<u32> },
-    SetId { id: u32 },
+    SendTransactionRequest {
+        request: TransactionRequest,
+        respond_to: oneshot::Sender<Option<TransactionReceipt>>,
+    },
+    DumpCache,
 }
 
-struct TxActor {
+struct TxActor<M>
+where
+    M: ManageConnection<Connection = rusqlite::Connection>,
+{
     receiver: mpsc::Receiver<ActorMessage>,
-    next_id: u32,
+    pub db_pool: Pool<M>,
+    cache: Vec<TransactionRequest>,
 }
 
-impl TxActor {
-    fn new(receiver: mpsc::Receiver<ActorMessage>) -> Self {
+impl<M> TxActor<M>
+where
+    M: ManageConnection<Connection = rusqlite::Connection>,
+{
+    fn new(receiver: mpsc::Receiver<ActorMessage>, db_pool: Pool<M>) -> Self {
+        let _ = db_pool.get().unwrap().execute(
+            "CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                tx_count INTEGER NOT NULL
+            )",
+            params![],
+        );
         TxActor {
             receiver,
-            next_id: 0,
+            db_pool,
+            cache: vec![],
         }
+    }
+
+    fn export_cache(&mut self) {
+        let db = self.db_pool.get().unwrap();
+        let stmts = self.cache.iter().map(|request| {
+            format!(
+                "INSERT INTO runs (timestamp, tx_count) VALUES ('{}', {});",
+                request.from.unwrap_or_default().encode_hex(),
+                request.gas.unwrap_or_default() as u64
+            )
+        });
+        db.execute_batch(&format!(
+            "BEGIN;
+            {}
+            COMMIT;",
+            stmts
+                .reduce(|acc, x| format!("{}\n{}", acc, x))
+                .unwrap_or_default(),
+        ))
+        .unwrap();
     }
 
     fn handle_message(&mut self, message: ActorMessage) {
         match message {
-            ActorMessage::GetUniqueId { respond_to } => {
-                self.next_id += 1;
-                println!("handle_message: GetUniqueId (next_id: {})", self.next_id);
-                let _ = respond_to.send(self.next_id);
+            ActorMessage::SendTransactionRequest {
+                request,
+                respond_to,
+            } => {
+                self.cache.push(request);
+                let _ = respond_to.send(None);
             }
-            ActorMessage::SetId { id } => {
-                // std::thread::sleep(Duration::from_millis(1));
-                println!("handle_message: SetId (id: {})", id);
-                self.next_id = id;
+            ActorMessage::DumpCache => {
+                self.export_cache();
             }
         }
     }
@@ -46,9 +93,12 @@ pub struct TxActorHandle {
 }
 
 impl TxActorHandle {
-    pub fn new(bufsize: usize) -> Self {
+    pub fn new<M: ManageConnection<Connection = rusqlite::Connection>>(
+        bufsize: usize,
+        db: Pool<M>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(bufsize);
-        let mut actor = TxActor::new(receiver);
+        let mut actor = TxActor::new(receiver, db);
         tokio::task::spawn(async move {
             actor.run().await;
         });
@@ -58,23 +108,44 @@ impl TxActorHandle {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let n = 5000_usize;
-    let actor = TxActorHandle::new(24);
+    let n = 1000_usize;
+    let mgr = SqliteConnectionManager::file("test.db");
+    let db = Pool::new(mgr).unwrap();
+    let actor = TxActorHandle::new(24, db.clone());
     let sender = Arc::new(actor.sender);
     let mut handles = vec![];
-    for i in 0..n {
+    for _ in 0..n {
         let sender = sender.clone();
         let handle = tokio::task::spawn(async move {
-            println!("sending SetId (id: {})", i);
+            let receipt_handle = oneshot::channel();
             sender
-                .send(ActorMessage::SetId { id: i as u32 })
+                .send(ActorMessage::SendTransactionRequest {
+                    request: TransactionRequest::default()
+                        .from(
+                            "0x1111111111111111111111111111111111111111"
+                                .parse()
+                                .unwrap(),
+                        )
+                        .gas_limit(100000)
+                        .to(Address::ZERO),
+                    respond_to: receipt_handle.0,
+                })
                 .await
                 .unwrap();
+            let receipt = receipt_handle.1.await.unwrap();
+            println!("receipt: {:?}", receipt);
         });
         handles.push(handle);
     }
     for handle in handles {
         handle.await.unwrap();
     }
+
+    sender.send(ActorMessage::DumpCache).await.unwrap();
+
+    let db = db.get().unwrap();
+    let count: u64 = db.query_row("SELECT COUNT(*) FROM runs", params![], |row| row.get(0))?;
+    println!("rows: {:?}", count);
+
     Ok(())
 }
